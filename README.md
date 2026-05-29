@@ -66,6 +66,7 @@ Nak-AIは、配信者のPC負荷を最小限に抑えつつ、安全でプライ
 
 * **OS**: Windows
 * **開発言語**: Python 3.13.5
+* **開発アシスタント**: Antigravity (AI coding assistant)
 
 ---
 
