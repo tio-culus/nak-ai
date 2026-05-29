@@ -25,6 +25,8 @@ __pycache__/
 dist/
 build/
 out/
+Output/
+*.spec
 .next/
 .nuxt/
 
