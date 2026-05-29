@@ -19,7 +19,7 @@ class STTEngine:
         # 音響判定パラメータ (デフォルト値)
         self.open_threshold = 0.015       # 開放しきい値 (発話開始の音量)
         self.close_threshold = 0.008      # 閉鎖しきい値 (発話継続・無音判定の音量)
-        self.silence_duration = 1.2       # 無音判定時間 (秒)
+        self.silence_duration = 3.0       # 無音判定時間 (秒) - 黒子モデル用にデフォルトを3.0秒に延長
         self.sample_rate = 16000          # 16kHz
         self.block_duration = 0.1         # 100msブロック
         self.block_size = int(self.sample_rate * self.block_duration)
@@ -40,6 +40,7 @@ class STTEngine:
         self.model_loading_error = None
         
         # バックグラウンドでのモデル非同期ロード開始 (UIをフリーズさせないため)
+        self.is_kana_hira_mode = False  # ひらがな・カタカナ誘導モードのフラグ (検証用)
         threading.Thread(target=self._load_model_async, daemon=True).start()
 
     def _load_model_async(self):
@@ -58,6 +59,10 @@ class STTEngine:
         self.close_threshold = close_threshold
         self.silence_duration = silence_duration
         self.silence_frames_limit = int(self.silence_duration / self.block_duration)
+
+    def set_output_mode(self, is_kana_hira_mode):
+        """音声認識結果をひらがな・カタカナのみの誘導にするかどうかのセッター"""
+        self.is_kana_hira_mode = is_kana_hira_mode
 
     def get_devices(self):
         """システムに接続されているマイクデバイスの一覧を取得する"""
@@ -172,6 +177,19 @@ class STTEngine:
                     # 発話中: 音声データをバッファに追加
                     self.voice_buffer.append(audio_data)
                     
+                    # セーフティガード: 3秒以上の沈黙がないまま45秒以上喋り続けた場合、
+                    # バッファの過度な肥大化とハルシネーションを防ぐため強制的に一度区切る
+                    max_frames = int(45.0 / self.block_duration)
+                    if len(self.voice_buffer) >= max_frames:
+                        print("[STTEngine] Safety Guard: 連続音声が45秒に達したため、強制的に一度区切って文字起こしを実行します。")
+                        full_audio = np.concatenate(self.voice_buffer)
+                        self.stt_task_queue.put(full_audio)
+                        
+                        # バッファのみをクリアし、発話状態（speaking）のまま次の音声を溜め始める
+                        self.voice_buffer = []
+                        self.silence_counter = 0
+                        continue
+                    
                     # 閉鎖しきい値を下回った場合、無音フレームをカウント
                     if rms < self.close_threshold:
                         self.silence_counter += 1
@@ -207,11 +225,17 @@ class STTEngine:
                 
                 # 音声認識の実行
                 # 指定モデルを使用。日本語に固定することで速度と精度を最適化
+                # ひらがな・カタカナ誘導モードの場合は強力な初期プロンプトを設定して漢字を抑制
+                prompt_val = None
+                if self.is_kana_hira_mode:
+                    prompt_val = "ひらがな と カタカナ のみで かいてください。かんじは つかわないで。こんにちは、きょうのてんきははれです。"
+                
                 segments, info = self.model.transcribe(
                     audio_data, 
                     beam_size=5, 
                     language="ja",
-                    vad_filter=True  # 内部のSilero VADを補助として有効化
+                    vad_filter=True,  # 内部のSilero VADを補助として有効化
+                    initial_prompt=prompt_val
                 )
                 
                 # 認識されたセグメントのテキストを連結
