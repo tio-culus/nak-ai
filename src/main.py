@@ -7,6 +7,20 @@ from tkinter import messagebox
 from engine.stt_engine import STTEngine
 from engine.keyring_manager import KeyringManager
 from engine.gemini_engine import GeminiEngine
+from engine.config_manager import ConfigManager
+# NakAIが公式にサポートするLLMモデルのホワイトリスト (モデルIDのセット)
+# Why not: なぜホワイトリスト形式かつセットでモデルIDを管理するのか？
+# ティオさんのご指摘通り、ブラックリスト形式ではGoogleが将来的に新たな特殊モデルを追加した際にすり抜けて表示されるリスクがあるため、
+# ホワイトリストで厳格に許可モデル（gemini-3.1-flash-lite）のみを制限するため。またセットで保持することでO(1)の高速な存在判定を行えるため。
+SUPPORTED_MODELS_WHITELIST = {"gemini-3.1-flash-lite"}
+
+# APIキー検証前のオフライン起動用フォールバック表示名マッピング
+# Why not: なぜオフライン用のフォールバック表示名マッピングを定義するのか？
+# アプリ起動時のようにAPIキー検証前でネットワーク通信を行っていない段階でも、
+# 保存済みのモデルIDに対応する表示名を安全かつ親切にUIドロップダウンに表示させ、滑らかなUXを提供するため。
+OFFLINE_DISPLAY_NAMES = {
+    "gemini-3.1-flash-lite": "Gemini 3.1 Flash-Lite"
+}
 
 class NakAIApp:
     def __init__(self, root):
@@ -39,8 +53,25 @@ class NakAIApp:
         self.is_kana_hira_mode = False 
         self.engine.set_output_mode(self.is_kana_hira_mode)
         
-        # APIキー取得
+        # 起動時のモデル一覧の初期化 (オフライン用)
+        # Why not: なぜ起動時に OFFLINE_DISPLAY_NAMES のコピーを保持するのか？
+        # まだAPI接続（キー検証）を行う前のオフライン起動時であっても、
+        # 保存されていた設定モデルIDに対応する表示名を安全にコンボボックスへ表示させ、
+        # 未検証状態でも快適な初期ロード状態を提供するため。
+        self.available_models = OFFLINE_DISPLAY_NAMES.copy()
+        
+        # APIキーおよびモデル設定取得
+        # Why not: なぜ保存済みのモデル名も取得するのか？
+        # 起動時に前回の選択モデルを自動で復元し、利用者が毎回モデルを再選択する手数を解消するため。
+        # Why not: なぜ KeyringManager ではなく ConfigManager なのか？
+        # ティオさんのご指摘通り、一般設定であるモデル名をKeyring（機密情報用）に同居させるのは設計意図に反するため、通常のJSON設定ファイル用クラスに切り分けて管理する。
+        # Why not: なぜmodel_var（Tkinter変数）に格納する際に表示名（display_name）に変換するのか？
+        # ティオさんのご指摘に従い、設定画面上にはユーザーフレンドリーで親切な表示名（例: Gemini 3.1 Flash-Lite）を表示し、直感的にモデルを認識させるため。
         self.api_key_val = tk.StringVar(value=KeyringManager.load_api_key())
+        loaded_model_id = ConfigManager.load_model_name()
+        display_name = self.available_models.get(loaded_model_id, "")
+        self.model_var = tk.StringVar(value=display_name)
+        self.api_key_valid = False  # APIキー接続検証完了フラグ（初期状態は無効）
         self.settings_expanded = False  # 設定エリアの展開フラグ
         self.last_gemini_request_time = 0.0  # レート制限回避用の前回のAPI送信時刻
         self.gemini_text_buffer = []  # クールダウン中に発生した発話を蓄積する文脈バッファ
@@ -65,6 +96,13 @@ class NakAIApp:
         
         # スレッドキューのポーリング（更新確認）監視開始
         self.root.after(100, self._poll_queues)
+        
+        # 起動時のAPIキー自動接続検証
+        # Why not: なぜ起動後1秒待ってから自動検証するのか？
+        # 起動直後のUI描画やWhisper初期読み込みタスクのCPU負荷と干渉せず、
+        # アプリ全体が完全に起動完了した落ち着いたタイミングで滑らかに接続確認を行うため。
+        if self.api_key_val.get().strip():
+            self.root.after(1000, lambda: self._fetch_latest_models(is_startup=True))
 
     def _create_widgets(self):
         # メインコンテナフレーム
@@ -115,6 +153,21 @@ class NakAIApp:
         self.key_entry = ttk.Entry(key_line, textvariable=self.api_key_val, show="*", width=30)
         self.key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         ttk.Button(key_line, text="保存", command=self._save_api_key, width=6).pack(side=tk.RIGHT)
+        
+        # モデル選択行
+        model_line = ttk.Frame(self.settings_frame)
+        model_line.pack(fill=tk.X, pady=4)
+        ttk.Label(model_line, text="使用LLMモデル:").pack(side=tk.LEFT, padx=(0, 5))
+        self.model_combo = ttk.Combobox(model_line, textvariable=self.model_var, state="readonly")
+        # Why not: なぜ available_models の値（表示名）一覧をあらかじめセットするのか？
+        # 起動直後のAPI未接続状態であっても、オフライン用マップに登録された許可モデル（表示名）を
+        # 初期選択肢として提供し、ユーザーに空でない状態を提示して安心感を与えるため。
+        # Why not: なぜ「更新」ボタンを設置しないのか？
+        # ティオさんのご指摘通り、ドロップダウンでモデルを選択した時点で config.json に即時保存され、
+        # またAPIキー保存時・起動時に自動でモデル一覧フェッチが走るため、手動ボタンは冗長であり排除するため。
+        self.model_combo['values'] = list(self.available_models.values())
+        self.model_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.model_combo.bind("<<ComboboxSelected>>", self._on_model_changed)
         
         # タイムライン表示オプション
         opt_lbl = ttk.Label(self.settings_frame, text="タイムライン表示オプション:", font=("Helvetica", 9, "bold"))
@@ -249,28 +302,74 @@ class NakAIApp:
             self.settings_expanded = True
 
     def _save_api_key(self):
-        """APIキーを資格情報マネージャーに安全に保存する"""
+        """入力されたAPIキーの有効性を接続テストで検証し、成功すれば安全に保存する"""
         key = self.api_key_val.get().strip()
         if not key:
             messagebox.showwarning("警告", "APIキーを入力してください。")
             return
             
-        success = KeyringManager.save_api_key(key)
-        if success:
-            messagebox.showinfo("成功", "APIキーをWindows資格情報マネージャーに安全に保存しました。")
-        else:
-            messagebox.showerror("エラー", "APIキーの保存に失敗しました。")
+        # 非同期接続検証をキック（保存アクション=True）
+        # Why not: なぜ保存の前に接続テストを走らせるのか？
+        # ティオさんのご指摘通り、無効なキーを誤って保存するのを完全に防ぎ、
+        # 確実にAPI接続が通る状態を保証してから設定を完了させるため。
+        self._fetch_latest_models(target_key=key, is_save_action=True)
+
+    def _on_model_changed(self, event=None):
+        """モデル選択が変更された際に安全に設定をconfig.jsonに永続保存し、配信ボタンを連動制御する"""
+        selected_display = self.model_var.get()
+        # Why not: なぜ available_models の値を走査してモデルIDを特定するのか？
+        # available_models は { model_id: display_name } 構造で統一しているため、
+        # 表示名からIDを引くには値側を走査する必要がある。構造を統一することで
+        # 起動時の復元検証をID基準で安全に行え、表記ブレによる誤検知を完全に排除できるため。
+        selected_model_id = ""
+        for m_id, m_disp in self.available_models.items():
+            if m_disp == selected_display:
+                selected_model_id = m_id
+                break
+        if selected_model_id:
+            # Why not: なぜ保存先に Keyring ではなく ConfigManager を使うのか？
+            # 資格情報マネージャー（Keyring）は機密性の高い資格情報を保護するための保管庫であり、
+            # 単なるモデルの名称設定を保存するのはアンチパターンのため、通常のJSON設定ファイルに分離する。
+            ConfigManager.save_model_name(selected_model_id)
+            print(f"[UI] ユーザーによって選択されたモデルIDをJSON設定ファイルに保存しました: {selected_model_id}")
+            
+            # Why not: なぜモデル変更時に配信開始ボタンの活性化をチェックするのか？
+            # ティオさんのご指摘通り、モデル未設定状態からユーザーが手動でモデルを選んだ瞬間に、
+            # Whisperロード完了などの他条件が揃っていれば即座に「配信開始」ボタンを押せるようにし、自然なUXを提供するため。
+            if self.api_key_valid and self.engine.model_loaded.is_set() and self.engine.model is not None:
+                self.status_label.config(
+                    text=f"[ステータス]: 準備完了 (Whisper準備完了 & Gemini({selected_display})接続成功)", 
+                    foreground="#27AE60"
+                )
+                self.start_btn.config(state=tk.NORMAL)
 
     def _check_model_loading(self):
         """非同期でのWhisperモデルのロード完了を監視する"""
         if self.engine.model_loaded.is_set():
             if self.engine.model is not None:
-                # ロード成功
-                self.status_label.config(
-                    text=f"[ステータス]: 準備完了 (モデル {self.engine.model_name} のロードが完了しました)", 
-                    foreground="#27AE60"
-                )
-                self.start_btn.config(state=tk.NORMAL)
+                # Whisperロード成功
+                # Why not: なぜ LLM APIキーの有効性と、モデルの選択状態の双方と連動させるのか？
+                # ティオさんのご指摘通り、APIキーだけでなく使用モデル名も確実に有効かつ選択された状態でのみ
+                # 配信ボタンをアクティブにし、不完全な構成での起動によるエラーを確実に防ぐため。
+                current_model = self.model_var.get()
+                if self.api_key_valid and current_model and current_model.strip():
+                    self.status_label.config(
+                        text=f"[ステータス]: 準備完了 (Whisper準備完了 & Gemini({current_model})接続成功)", 
+                        foreground="#27AE60"
+                    )
+                    self.start_btn.config(state=tk.NORMAL)
+                elif self.api_key_valid:
+                    self.status_label.config(
+                        text="[ステータス]: モデル未選択 (Whisper準備完了。接続設定からLLMモデルを選択してください)", 
+                        foreground="#D35400"
+                    )
+                    self.start_btn.config(state=tk.DISABLED)
+                else:
+                    self.status_label.config(
+                        text="[ステータス]: 接続待ち (Whisper準備完了。接続設定からAPIキーを保存してください)", 
+                        foreground="#D35400"
+                    )
+                    self.start_btn.config(state=tk.DISABLED)
             else:
                 # ロード失敗
                 self.status_label.config(
@@ -312,12 +411,27 @@ class NakAIApp:
             return
             
         # 2. Gemini chats セッションの開始
-        # Why not: なぜここでAPIキーを渡してセッションを起動するのか？
-        # 配信の開始と同時にコンテキスト保持用のセッションを初期化することで、
-        # ユーザーに二度手間をかけさせず、シームレスな実況開始体験を提供する設計にするため。
-        success = self.gemini_engine.start_session(api_key)
+        # Why not: なぜここでAPIキーとUIで選択されたモデル名を渡してセッションを起動するのか？
+        # 配信の開始と同時に、ユーザーがドロップダウンで選択した最新のLLMモデルでコンテキスト保持用のセッションを初期化し、
+        # シームレスかつ正確な実況開始体験を提供する設計にするため。
+        # Why not: なぜ表示名ではなくモデルIDを available_models から走査して engine に渡すのか？
+        # available_models は { model_id: display_name } 構造に統一しているため、
+        # 表示名から値を走査してIDを特定する。config.json に保存されるのもIDであり、
+        # Gemini APIの呼び出しにも正式なモデルIDを渡す必要があるため。
+        display_name = self.model_var.get()
+        model_id = ""
+        for m_id, m_disp in self.available_models.items():
+            if m_disp == display_name:
+                model_id = m_id
+                break
+        
+        if not model_id or not model_id.strip():
+            messagebox.showerror("エラー", "有効なLLMモデルが設定されていません。\n接続設定から使用するモデルを選択し直してください。")
+            return
+            
+        success = self.gemini_engine.start_session(api_key, model_id)
         if not success:
-            messagebox.showerror("エラー", "配信セッションの初期化に失敗しました。\nAPIキーが有効であるかご確認ください。")
+            messagebox.showerror("エラー", f"配信セッション({display_name})の初期化に失敗しました。\nAPIキーが有効であるか、また選択されたモデルが現在も有効であるかご確認ください。")
             return
             
         # バッファと前回のスマートデバウンス要求時間をクリーンにリセット
@@ -487,6 +601,126 @@ class NakAIApp:
         # 100ms後に再スケジュール
         if self.root.winfo_exists():
             self.root.after(100, self._poll_queues)
+
+    def _fetch_latest_models(self, target_key=None, is_save_action=False, is_startup=False):
+        """
+        Gemini APIから最新の利用可能モデル一覧を非同期で取得する（APIキー検証も兼ねる）
+        """
+        api_key = target_key if target_key else self.api_key_val.get().strip()
+        if not api_key:
+            if not is_startup:
+                messagebox.showwarning("警告", "APIキーが設定されていません。")
+            return
+            
+        if is_save_action:
+            self.status_label.config(text="[ステータス]: APIキーの有効性を検証中...", foreground="#2980B9")
+            
+        def run():
+            try:
+                from google import genai
+                client = genai.Client(api_key=api_key)
+                
+                # models.list を呼び出し、例外が出なければAPIキーは有効とみなせる
+                # Why not: なぜモデル名と表示名のタプルを蓄積してUIスレッドに引き渡すのか？
+                # ティオさんからご提案いただいた通り、GenAI SDK の Model オブジェクトには正確な name (ID) と
+                # display_name (表示名) の両方が含まれるため、これをペアでメインスレッドに安全に送り、
+                # UI用ドロップダウンとIDの逆引き不要な動的マッピングを直接構築できるようにするため。
+                model_pairs = []
+                for m in client.models.list():
+                    name = m.name
+                    if name.startswith("models/"):
+                        name = name[7:]
+                    display_name = m.display_name if m.display_name else name
+                    model_pairs.append((name, display_name))
+                            
+                if not model_pairs:
+                    raise Exception("利用可能なGeminiモデルが見つかりませんでした。")
+                    
+                model_pairs.sort(key=lambda x: x[1])  # 表示名順でソート
+                
+                # メインUIスレッドへ安全に更新通知
+                self.root.after(0, lambda: self._on_validation_success(api_key, model_pairs, is_save_action, is_startup))
+            except Exception as e:
+                err_str = str(e)
+                self.root.after(0, lambda: self._on_validation_failure(err_str, is_save_action, is_startup))
+                
+        import threading
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_validation_success(self, api_key, model_pairs, is_save_action, is_startup):
+        """APIキー接続検証の成功時ハンドラ"""
+        self.api_key_valid = True
+        
+        if is_save_action:
+            KeyringManager.save_api_key(api_key)
+            messagebox.showinfo("成功", "APIキーの有効性を確認し、Windows資格情報マネージャーに安全に保存しました！")
+            
+        # APIが実際に返したモデル一覧とホワイトリストを交差させ、{ model_id: display_name } の動的マッピングを構築
+        # Why not: なぜ available_models を { model_id: display_name } 構造で統一するのか？
+        # config.json に保存されるのは不変のモデルID（例: gemini-3.1-flash-lite）であり、
+        # 再起動時の復元検証もID基準で行うことで、Google側の display_name 表記変更や微細なブレに影響されず
+        # 100%安全にモデルを復元できるようにするため。
+        self.available_models = {}
+        for m_id, m_disp in model_pairs:
+            if m_id in SUPPORTED_MODELS_WHITELIST:
+                self.available_models[m_id] = m_disp
+                
+        available_displays = list(self.available_models.values())
+        self.model_combo['values'] = available_displays
+        
+        # Why not: なぜ表示名ではなくモデルIDで有効性を検証するのか？
+        # config.json に保存されているのはモデルIDであり、IDで突き合わせることで
+        # display_name の微細な表記ブレによる「無効なモデル」誤検知を完全に排除するため。
+        loaded_model_id = ConfigManager.load_model_name()
+        if loaded_model_id and loaded_model_id in self.available_models:
+            # IDに対応する最新の表示名を取得してComboboxにセット
+            restored_display = self.available_models[loaded_model_id]
+            self.model_combo.set(restored_display)
+            self.model_var.set(restored_display)
+            
+            # 有効なモデルがセットされていて、かつWhisperのロードが終わっていれば配信ボタンを活性化
+            if self.engine.model_loaded.is_set() and self.engine.model is not None:
+                self.status_label.config(
+                    text=f"[ステータス]: 準備完了 (Whisper準備完了 & Gemini({restored_display})接続成功)", 
+                    foreground="#27AE60"
+                )
+                self.start_btn.config(state=tk.NORMAL)
+            else:
+                self.status_label.config(
+                    text=f"[ステータス]: Whisper({self.engine.model_name}) モデルをロード中... (LLM接続完了)", 
+                    foreground="#D35400"
+                )
+                self.start_btn.config(state=tk.DISABLED)
+        else:
+            # 過去に設定したモデルが存在しないか、空である場合
+            self.model_combo.set("")
+            ConfigManager.save_model_name("")
+            self.start_btn.config(state=tk.DISABLED)
+            
+            if not loaded_model_id:
+                self.status_label.config(
+                    text="[ステータス]: モデル未選択 (接続設定から使用するLLMモデルを選択してください)", 
+                    foreground="#D35400"
+                )
+            else:
+                self.status_label.config(
+                    text=f"[ステータス]: 警告 (過去に設定したモデル '{loaded_model_id}' は無効です。選択し直してください)", 
+                    foreground="#C0392B"
+                )
+
+    def _on_validation_failure(self, err_msg, is_save_action, is_startup):
+        """APIキー接続検証の失敗時ハンドラ"""
+        self.api_key_valid = False
+        self.start_btn.config(state=tk.DISABLED)
+        
+        if is_save_action:
+            messagebox.showerror("検証失敗", f"APIキーの検証に失敗しました。正しいキーかご確認ください:\n\n{err_msg}")
+            self.status_label.config(text="[ステータス]: 接続エラー (無効なAPIキーです)", foreground="#C0392B")
+        else:
+            if is_startup:
+                self.status_label.config(text="[ステータス]: 接続エラー (保存済みAPIキーの自動接続検証に失敗しました。キーを再設定してください)", foreground="#C0392B")
+            else:
+                messagebox.showerror("エラー", f"最新モデル一覧の取得に失敗しました:\n{err_msg}")
 
 def main():
     root = tk.Tk()
