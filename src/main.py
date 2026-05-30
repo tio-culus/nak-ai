@@ -199,10 +199,12 @@ class NakAIApp:
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=(0, 10))
         
-        self.start_btn = ttk.Button(btn_frame, text=" 音声認識 開始 ", command=self._start_stt, state=tk.DISABLED)
+        # Why not: なぜ「音声認識開始」ではなく「配信開始」にするのか？
+        # 音声認識だけでなく、Geminiのchatsセッション管理のライフサイクルをこのボタン1つで完全に同期・連動させるため。
+        self.start_btn = ttk.Button(btn_frame, text=" 配信開始 ", command=self._start_delivery, state=tk.DISABLED)
         self.start_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         
-        self.stop_btn = ttk.Button(btn_frame, text=" 停止 ", command=self._stop_stt, state=tk.DISABLED)
+        self.stop_btn = ttk.Button(btn_frame, text=" 配信終了 ", command=self._stop_delivery, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(5, 0))
         
         # ==========================================
@@ -293,16 +295,37 @@ class NakAIApp:
         # エンジンへ動的にしきい値を通知
         self.engine.set_thresholds(open_val, close_val, silence_val)
 
-    def _start_stt(self):
-        """音声認識の開始処理"""
+    def _start_delivery(self):
+        """配信開始処理 (chatsセッション開始 & 音声認識起動)"""
         selected_index = self.device_combo.current()
         if selected_index < 0:
             messagebox.showwarning("警告", "マイクデバイスを選択してください。")
             return
         
-        # エンジン用デバイスインデックスの取得
-        dev_id = self.devices[selected_index][0]
+        # 1. APIキーのセキュアな取得
+        api_key = self.api_key_val.get().strip()
+        if not api_key:
+            api_key = KeyringManager.load_api_key()
+            
+        if not api_key:
+            messagebox.showwarning("警告", "APIキーが設定されていません。\nLLM連携設定からAPIキーを入力して保存してください。")
+            return
+            
+        # 2. Gemini chats セッションの開始
+        # Why not: なぜここでAPIキーを渡してセッションを起動するのか？
+        # 配信の開始と同時にコンテキスト保持用のセッションを初期化することで、
+        # ユーザーに二度手間をかけさせず、シームレスな実況開始体験を提供する設計にするため。
+        success = self.gemini_engine.start_session(api_key)
+        if not success:
+            messagebox.showerror("エラー", "配信セッションの初期化に失敗しました。\nAPIキーが有効であるかご確認ください。")
+            return
+            
+        # バッファと前回のスマートデバウンス要求時間をクリーンにリセット
+        self.gemini_text_buffer = []
+        self.last_gemini_request_time = 0.0 # 開始直後の最初の発言は30秒待たずに即時送信可能にする
         
+        # 3. 音声認識エンジンの起動
+        dev_id = self.devices[selected_index][0]
         try:
             # 閾値と動作モードを最新のUI状態にしてからエンジンを起動
             self._on_threshold_changed()
@@ -310,28 +333,48 @@ class NakAIApp:
             self.engine.start(dev_id)
             
             # UI状態の切り替え
-            self.status_label.config(text="[ステータス]: 音声認識中 (実況を監視しています)", foreground="#2980B9") # ブルー
+            self.status_label.config(text="[ステータス]: 配信中 (AI仲居がお耳を傾けています)", foreground="#2980B9") # ブルー
             self.start_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
             self.device_combo.config(state=tk.DISABLED)
+            
+            # タイムラインにセッション開始案内を表示 (完全左寄せ)
+            self.text_area.configure(state=tk.NORMAL)
+            self.text_area.insert(tk.END, "🔔 --- 配信セッションが開始されました --- 🔔\n\n", "whisper")
+            self.text_area.see(tk.END)
+            self.text_area.configure(state=tk.DISABLED)
         except Exception as e:
-            messagebox.showerror("エラー", f"音声キャプチャの開始に失敗しました:\n{e}")
+            messagebox.showerror("エラー", f"配信開始（音声認識）に失敗しました:\n{e}")
 
-    def _stop_stt(self):
-        """音声認識の停止処理"""
+    def _stop_delivery(self):
+        """配信終了処理 (音声認識停止 & 最終要約の非同期生成)"""
         try:
+            # 1. 音声認識の停止
             self.engine.stop()
             
             # UI状態の切り替え
-            self.status_label.config(text="[ステータス]: 準備完了 (監視を停止しました)", foreground="#27AE60")
+            self.status_label.config(text="[ステータス]: 配信終了 (本日も素晴らしい実況でございました)", foreground="#27AE60")
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
             self.device_combo.config(state="readonly")
             
             # 音量メーターを完全にリセット
             self.vol_bar['value'] = 0
+            
+            # タイムラインにセッション終了案内と、要約作成中メッセージを表示 (完全左寄せ)
+            self.text_area.configure(state=tk.NORMAL)
+            self.text_area.insert(tk.END, "🔔 --- 配信セッションが終了しました --- 🔔\n", "whisper")
+            self.text_area.insert(tk.END, "✨ AI仲居が本日の実況を振り返り、要約（サマリー）をまとめております。少々お待ちくださいませ...\n\n", "ai_corrected")
+            self.text_area.see(tk.END)
+            self.text_area.configure(state=tk.DISABLED)
+            
+            # 2. Geminiセッションを終了し、配信全体の最終要約（サマリー）の非同期生成を要求
+            # Why not: なぜここで非同期に要約させるのか？
+            # 要約生成には数秒のGemini API呼び出し時間がかかるため、UIスレッドをフリーズさせずに、
+            # バックグラウンドで安全に生成して結果キュー経由でタイムラインに流すため。
+            self.gemini_engine.end_session()
         except Exception as e:
-            messagebox.showerror("エラー", f"音声キャプチャの停止中にエラーが発生しました:\n{e}")
+            messagebox.showerror("エラー", f"配信終了処理中にエラーが発生しました:\n{e}")
 
     def _poll_queues(self):
         """STTエンジン、リアルタイム音量、およびGeminiの補正結果を周期的に回収してタイムラインを更新する (100ms周期)"""
@@ -388,7 +431,7 @@ class NakAIApp:
                 print(f"[UI] スマートデバウンス制限クリア！溜まったバッファを結合してGeminiへ送信します (結合テキスト: \"{full_merged_text}\")")
                 
                 self.last_gemini_request_time = current_time
-                self.gemini_engine.request_analysis(full_merged_text, self.is_kana_hira_mode)
+                self.gemini_engine.request_analysis(full_merged_text)
                 
                 # 送信したためバッファをクリア
                 self.gemini_text_buffer = []
@@ -399,22 +442,41 @@ class NakAIApp:
         try:
             while True:
                 success, corrected, advice, duration = self.gemini_queue.get_nowait()
-                print(f"[UI] Gemini結果をQueueから受信! (成否: {success}, 補正: \"{corrected}\", 時間: {duration:.2f}s)")
+                print(f"[UI] Gemini結果をQueueから受信! (成否: {success}, 補正: \"{corrected}\", 時間: {duration:.2f}s, タイプ: {advice})")
                 
                 self.text_area.configure(state=tk.NORMAL)
                 
                 if success:
-                    # 1. AI発話補正テキストの描画 (表示オプションONの場合のみ、完全左寄せ)
-                    if self.show_ai_corrected.get():
-                        self.text_area.insert(tk.END, f"✨ AI補正 [思考: {duration:.2f}s]: {corrected}\n", "ai_corrected")
-                    
-                    # 2. AI助言の描画 (常時表示されるタイムラインの主役、完全左寄せ)
-                    self.text_area.insert(tk.END, f"💬 仲居助言: {advice}\n", "ai_advice")
-                    self.text_area.insert(tk.END, "\n", "whisper")  # タイムラインの塊ごとの適度な余白
+                    if advice == "summary":
+                        # 最終配信サマリーの描画処理
+                        # Why not: 配信全体の締めくくりとして、通常の助言タイムラインと
+                        # 明確に区別された美しい区切り線と装飾でサマリーを描画し、特別感を演出します。
+                        self.text_area.insert(tk.END, "\n" + "─" * 40 + "\n", "whisper")
+                        self.text_area.insert(tk.END, f"✨ 本日の配信サマリー [作成時間: {duration:.2f}s]\n", "ai_advice")
+                        self.text_area.insert(tk.END, f"{corrected}\n", "whisper")
+                        self.text_area.insert(tk.END, "─" * 40 + "\n\n", "whisper")
+                        
+                        # ステータスを準備完了に戻す
+                        self.status_label.config(text="[ステータス]: 準備完了 (配信要約を生成しました)", foreground="#27AE60")
+                    else:
+                        # 1. AI発話補正テキストの描画 (表示オプションONの場合のみ、完全左寄せ)
+                        if self.show_ai_corrected.get():
+                            self.text_area.insert(tk.END, f"✨ AI補正 [思考: {duration:.2f}s]: {corrected}\n", "ai_corrected")
+                        
+                        # 2. AI助言の描画 (常時表示されるタイムラインの主役、完全左寄せ)
+                        self.text_area.insert(tk.END, f"💬 仲居助言: {advice}\n", "ai_advice")
+                        self.text_area.insert(tk.END, "\n", "whisper")  # タイムラインの塊ごとの適度な余白
                 else:
-                    # 恒久エラー発生時: 配信者用の優しい情緒的なエラーテキストを表示 (完全左寄せ)
-                    self.text_area.insert(tk.END, f"⚠️ AI仲居: {corrected}\n", "ai_corrected")
-                    self.text_area.insert(tk.END, "\n", "whisper")
+                    if advice == "summary":
+                        # サマリー生成エラー時
+                        self.text_area.insert(tk.END, "\n" + "─" * 40 + "\n", "whisper")
+                        self.text_area.insert(tk.END, f"⚠️ AI仲居: {corrected}\n", "ai_corrected")
+                        self.text_area.insert(tk.END, "─" * 40 + "\n\n", "whisper")
+                        self.status_label.config(text="[ステータス]: 準備完了 (要約の生成に失敗しました)", foreground="#C0392B")
+                    else:
+                        # 恒久エラー発生時: 配信者用の優しい情緒的なエラーテキストを表示 (完全左寄せ)
+                        self.text_area.insert(tk.END, f"⚠️ AI仲居: {corrected}\n", "ai_corrected")
+                        self.text_area.insert(tk.END, "\n", "whisper")
                     
                 self.text_area.see(tk.END)  # 最下部へ自動スクロール
                 self.text_area.configure(state=tk.DISABLED)
