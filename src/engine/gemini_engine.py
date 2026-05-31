@@ -38,24 +38,36 @@ class GeminiEngine:
         self.client = None
         self.chat = None
 
-    def start_session(self, api_key: str) -> bool:
+    def start_session(self, api_key: str, model_name: str) -> bool:
         """
         配信開始時に新しいchatsセッションを起動する。
         Why not: なぜ初回メッセージでシステム設定を送らないのか？
         初回メッセージで設定を送ると、Structured Outputsのスキーマ制約により、APIが無理やりJSONを返そうとしてエラーになる。
         system_instruction（システム指示）に定義を渡すことで、初期メッセージ不要で安全にセッション全体へルールを永続適用できる。
         """
-        print("\n[GeminiEngine] >>> 配信セッションを開始します。")
+        print(f"\n[GeminiEngine] >>> 配信セッションを開始します。モデル: {model_name}")
         if not api_key:
             print("[GeminiEngine] ERROR: APIキーが指定されていません。")
             return False
+
+        # Why not: なぜ model_name.strip() が空かどうかの判定だけで十分なのか？
+        # ティオさんのご指摘通り、呼び出し側の Tkinter 制御部から渡される model_name は常に str であることが保証されており、
+        # 冗長な None チェックを行わずとも安全かつシンプルに空値判定を行えるため。
+        if not model_name.strip():
+            print("[GeminiEngine] ERROR: 有効なLLMモデル名が指定されていません。")
+            return False
+
+        # Why not: なぜモデル名をインスタンス変数に保持するのか？
+        # 配信中に使っているモデルと、配信終了時の「最終要約（サマリー）」で用いるモデルを完全に一致させ、
+        # 異なるモデルが意図せず起動する挙動を防ぐと同時に、開発者が指定したクォータやリミットの枠内に安全に収めるため。
+        self.model_name = model_name.strip()
 
         try:
             self.client = genai.Client(api_key=api_key)
             
             # chats.createを用いてセッションを開始
             self.chat = self.client.chats.create(
-                model='gemini-2.5-flash',
+                model=self.model_name,
                 config=types.GenerateContentConfig(
                     system_instruction=NAK_AI_SYSTEM_INSTRUCTION,
                     response_mime_type="application/json",
@@ -63,7 +75,7 @@ class GeminiEngine:
                     temperature=0.3, # 補正と助言のブレを抑えるために低めの創造性に設定
                 )
             )
-            print("[GeminiEngine] chatsセッションが正常に初期化されました。")
+            print(f"[GeminiEngine] chatsセッション({self.model_name})が正常に初期化されました。")
             return True
         except Exception as e:
             print(f"[GeminiEngine] chatsセッション初期化エラー: {e}", file=sys.stderr)
@@ -188,8 +200,11 @@ class GeminiEngine:
             # Why not: なぜchatsセッション上で要約を頼まないのか？
             # chatsセッション上で頼んでしまうと、「要約テキスト」自体がチャット履歴に含まれてしまい、
             # 次回のセッション開始や履歴追跡に悪影響を及ぼすため、要約は単発のgenerate_contentで完全に切り離して実行する。
+            # Why not: なぜここでも self.model_name を使用するのか？
+            # 配信中に使っているモデルと要約に使用するモデルを完全に同期させ、別モデルが不要にロードされるのを防ぎ、
+            # 開発者が指定したクォータや挙動を一元管理できるようにするため。
             summary_response = self.client.models.generate_content(
-                model='gemini-2.5-flash',
+                model=self.model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     temperature=0.7, # 要約の表現に豊かな温かみを持たせるため、少し高めに設定
