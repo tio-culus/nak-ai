@@ -26,7 +26,9 @@ dist/
 build/
 out/
 Output/
-*.spec
+# Why not: なぜ *.spec を除外しないのか？
+# NakAI.spec はPyInstallerのビルド設定であり、リポジトリで管理すべきファイルのため。
+# *.spec
 .next/
 .nuxt/
 
@@ -57,3 +59,8 @@ Thumbs.db
 .cache/
 .parcel-cache/
 .eslintcache
+
+# Sound effect assets (OtoLogicの利用規約により素材そのものの再配布は禁止)
+# 開発者は scripts/download_se.py を実行してローカルにセットアップしてください。
+src/assets/sounds/*.wav
+src/assets/sounds/*.mp3

@@ -8,6 +8,7 @@ from engine.stt_engine import STTEngine
 from engine.keyring_manager import KeyringManager
 from engine.gemini_engine import GeminiEngine
 from engine.config_manager import ConfigManager
+from engine.sound_player import SoundPlayer
 # NakAIが公式にサポートするLLMモデルのホワイトリスト (モデルIDのセット)
 # Why not: なぜホワイトリスト形式かつセットでモデルIDを管理するのか？
 # ティオさんのご指摘通り、ブラックリスト形式ではGoogleが将来的に新たな特殊モデルを追加した際にすり抜けて表示されるリスクがあるため、
@@ -40,6 +41,9 @@ class NakAIApp:
         
         # Gemini連携エンジンの初期化
         self.gemini_engine = GeminiEngine(self.gemini_queue)
+        
+        # 通知音プレイヤーの初期化
+        self.sound_player = SoundPlayer()
         
         # GUI変数の初期化
         self.selected_device_id = tk.IntVar()
@@ -579,6 +583,9 @@ class NakAIApp:
                         
                         # 2. AI助言の描画 (常時表示されるタイムラインの主役、完全左寄せ)
                         self.text_area.insert(tk.END, f"💬 仲居助言: {advice}\n", "ai_advice")
+                        
+                        # 仲居助言がタイムラインに表示された瞬間に通知音を再生
+                        self.sound_player.play()
                         self.text_area.insert(tk.END, "\n", "whisper")  # タイムラインの塊ごとの適度な余白
                 else:
                     if advice == "summary":
